@@ -18,12 +18,47 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ## Writing modules
 
-**The module contract is not defined yet.** It lands in Phase 1 of `ROADMAP.md`, a
-`ModuleBase` class, pydantic option models, and a machine-consumable `Result` schema that
-session save/load and module chaining will consume. Until that contract is pinned by tests,
-please do not write modules; they would be built on sand and rewritten.
+The module contract (v1) lives in `src/voidkit/contract/` and is pinned by
+`tests/test_contract_*.py`. A module is three pieces:
 
-Once the contract exists, this section will document it. The conventions already settled:
+```python
+from voidkit.contract import ModuleBase, ModuleOptions, Result, RunContext, option, record
+
+class PingOptions(ModuleOptions):
+    target: str = option(description="Host to ping.")          # no default = required
+    count: int = option(4, description="Probes to send.", ge=1)
+
+class Ping(ModuleBase):
+    name = "ping"
+    category = "recon"
+    description = "ICMP reachability check."
+    options_model = PingOptions
+
+    def run(self, context: RunContext) -> Result:
+        # self.opts is the validated PingOptions instance
+        return self.ok(
+            records=[record("host", address=self.opts.target, state="up")],
+            summary=f"{self.opts.target} is up",
+        )
+```
+
+Rules of the contract:
+
+- **Never return a raw dict**; build the `Result` with `self.ok()`, `self.partial()`
+  (some records plus errors), or `self.error()`. The builders fill in the module address,
+  timestamps, and the options snapshot.
+- **Emit findings as typed records** (`record("host", address=...)`) with stable,
+  snake_case field names. Records are the chaining unit: a downstream module reads them
+  via `result.records_of("host")` or `result.values("host", "address")`. Run-level
+  scalars (counts, derived values) go in `keys`.
+- **Everything in a `Result` must be JSON-serializable**; the schema enforces it.
+  Session save/load (Phase 4) persists results verbatim via `to_dict()`/`from_dict()`.
+- The framework calls `execute()`, which validates options first (raising
+  `OptionValidationError` before any work happens) and converts an uncaught exception
+  from `run()` into an error `Result`.
+- `EchoModule` in `tests/test_contract_module.py` is the reference implementation.
+
+The conventions already settled:
 
 - Modules live under `modules/` and are addressed as `category/module_name` (snake_case),
   e.g. `recon/port_scan`.

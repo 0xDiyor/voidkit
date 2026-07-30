@@ -52,7 +52,7 @@ voidkit (recon/port_scan) > show results
 ## Roadmap
 
 - [ ] Core shell + module loader
-- [ ] Module contract v1 (base class, result schema)
+- [x] Module contract v1 (base class, result schema)
 - [ ] First modules: ping, port_scan, dns_enum
 - [ ] Session save/load
 - [ ] Module chaining (pipe output of one module into another)
