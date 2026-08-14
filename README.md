@@ -53,7 +53,7 @@ voidkit (recon/port_scan) > show results
 
 - [ ] Core shell + module loader
 - [x] Module contract v1 (base class, result schema)
-- [ ] First modules: ping, port_scan, dns_enum
+- [x] First modules: ping, port_scan, dns_enum
 - [ ] Session save/load
 - [ ] Module chaining (pipe output of one module into another)
 - [ ] Wazuh integration
