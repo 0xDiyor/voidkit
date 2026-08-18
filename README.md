@@ -51,11 +51,11 @@ voidkit (recon/port_scan) > show results
 
 ## Roadmap
 
-- [ ] Core shell + module loader
+- [x] Core shell + module loader
 - [x] Module contract v1 (base class, result schema)
 - [x] First modules: ping, port_scan, dns_enum
-- [ ] Session save/load
-- [ ] Module chaining (pipe output of one module into another)
+- [x] Session save/load
+- [x] Module chaining (pipe output of one module into another)
 - [ ] Wazuh integration
 - [ ] TUI mode (Textual)
 - [ ] v1.0 release

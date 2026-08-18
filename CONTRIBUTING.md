@@ -66,6 +66,50 @@ The conventions already settled:
 - Use `structlog` for the operator audit trail and `rich` for user-facing shell output;
   keep the two separate.
 
+## Chaining and sessions (Phase 4)
+
+Chaining pipes one module's `Result` into the next as `context.upstream`. A downstream
+module reads the upstream records with the same selectors it would use on any result:
+
+```python
+class HostCount(ModuleBase):
+    name = "host_count"
+    category = "analysis"
+
+    def run(self, context: RunContext) -> Result:
+        if context.upstream is None:
+            return self.error("no upstream result to consume; 'chain from <module>' first")
+        addresses = context.upstream.values("host", "address")
+        return self.ok(records=[record("host", address=a) for a in addresses])
+```
+
+The shell drives this without changing the contract. The UX is one command:
+
+- `chain from <result-id|category/name>`: point the next run's `upstream` at a stored
+  result. The reference is an exact result id, an id prefix (the 8-char form `show results`
+  prints), or a module address (resolves to that module's most recent result).
+- `chain` / `chain show`: report the current source.
+- `chain clear`: stop chaining; runs go back to standalone.
+
+The chain source is sticky: it stays set across `use` and multiple `run`s until you clear
+it or point it somewhere else. Then `run` passes the chosen result through to `execute()`
+as `RunContext.upstream`. If the source is no longer in the store the run is refused with a
+clear message rather than silently dropping the upstream.
+
+Sessions persist the working state, selected module, its options, the whole result store,
+and the chain source, to JSON under `./sessions` (or `$VOIDKIT_SESSIONS_DIR`, or
+`--sessions-dir`):
+
+- `save <name>` writes `<sessions-dir>/<name>.json`.
+- `load <name>` restores it: results repopulate the store, the module and its options are
+  reselected, and the chain source is restored (if it still resolves). A missing or corrupt
+  file is reported, not fatal.
+
+Because results serialize verbatim (`Result.to_dict()`/`from_dict()`) and carry stable ids,
+a chain survives a save/load boundary: save a session, load it into a fresh shell, and
+`chain from` a restored result to run the downstream module. `voidkit.session.Session` owns
+the state container and disk I/O; the shell maps itself to and from it.
+
 ## Code conventions
 
 - Lint and format with `ruff` (line length 100, target Python 3.11). CI enforces
