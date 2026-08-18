@@ -20,6 +20,7 @@ from voidkit.log_config import configure_logging
 from voidkit.shell import Shell
 
 DEFAULT_MODULES_DIR = "modules"
+DEFAULT_SESSIONS_DIR = "sessions"
 
 BANNER = r"""
              _     _ _    _ _
@@ -45,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("VOIDKIT_MODULES_DIR", DEFAULT_MODULES_DIR),
         help="Directory to discover modules from (default: $VOIDKIT_MODULES_DIR or ./modules).",
     )
+    parser.add_argument(
+        "--sessions-dir",
+        default=os.environ.get("VOIDKIT_SESSIONS_DIR", DEFAULT_SESSIONS_DIR),
+        help="Directory to save/load sessions in (default: $VOIDKIT_SESSIONS_DIR or ./sessions).",
+    )
     return parser
 
 
@@ -67,5 +73,5 @@ def main(argv: list[str] | None = None) -> int:
     print_banner(console)
 
     loader = ModuleLoader(Path(args.modules_dir))
-    Shell(loader=loader, console=console).run()
+    Shell(loader=loader, console=console, sessions_dir=Path(args.sessions_dir)).run()
     return 0
