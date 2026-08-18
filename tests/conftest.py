@@ -78,6 +78,28 @@ class Crash(ModuleBase):
         raise RuntimeError("boom")
 '''
 
+# Downstream chaining demo: consumes host records from an upstream result and
+# re-emits them, so a test can assert the downstream Result reflects upstream data.
+HOSTCOUNT_MODULE = '''
+from voidkit.contract import ModuleBase, Result, RunContext, record
+
+
+class HostCount(ModuleBase):
+    name = "host_count"
+    category = "analysis"
+    description = "Count and echo host records from the upstream result."
+
+    def run(self, context: RunContext) -> Result:
+        if context.upstream is None:
+            return self.error("no upstream result to consume; 'chain from <module>' first")
+        addresses = context.upstream.values("host", "address")
+        return self.ok(
+            records=[record("host", address=address) for address in addresses],
+            keys={"host_count": len(addresses), "source_result": context.upstream.id},
+            summary=f"{len(addresses)} host(s) from {context.upstream.module_path}",
+        )
+'''
+
 
 def write_module(base: Path, category: str, name: str, source: str) -> Path:
     """Write ``base/<category>/<name>.py`` (creating the category dir)."""
@@ -115,3 +137,38 @@ def console(console_buffer: StringIO) -> Console:
 @pytest.fixture
 def shell(loader: ModuleLoader, console: Console) -> Shell:
     return Shell(loader=loader, store=ResultStore(), console=console)
+
+
+# -- chaining / session fixtures ----------------------------------------------
+# A separate module dir that also carries the downstream ``analysis/host_count``
+# module, kept apart from ``module_dir`` so the existing completion tests (which
+# assert an exact discovered-module list) stay unaffected.
+
+
+@pytest.fixture
+def chain_module_dir(tmp_path: Path) -> Path:
+    write_module(tmp_path, "analysis", "echo", ECHO_MODULE)
+    write_module(tmp_path, "recon", "sample", SAMPLE_MODULE)
+    write_module(tmp_path, "analysis", "crash", CRASH_MODULE)
+    write_module(tmp_path, "analysis", "host_count", HOSTCOUNT_MODULE)
+    return tmp_path
+
+
+@pytest.fixture
+def chain_loader(chain_module_dir: Path) -> ModuleLoader:
+    return ModuleLoader(chain_module_dir)
+
+
+@pytest.fixture
+def sessions_dir(tmp_path: Path) -> Path:
+    return tmp_path / "sessions"
+
+
+@pytest.fixture
+def chain_shell(chain_loader: ModuleLoader, console: Console, sessions_dir: Path) -> Shell:
+    return Shell(
+        loader=chain_loader,
+        store=ResultStore(),
+        console=console,
+        sessions_dir=sessions_dir,
+    )

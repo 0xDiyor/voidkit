@@ -20,22 +20,40 @@ A module can only ever return an error :class:`Result`; it cannot crash the shel
 
 from __future__ import annotations
 
+import os
+import re
 import sys
+from pathlib import Path
 
 import structlog
 from rich.console import Console
 from rich.table import Table
 
-from voidkit.contract import ModuleBase, OptionError, OptionValidationError, Result, ResultStatus
+from voidkit.contract import (
+    ModuleBase,
+    OptionError,
+    OptionValidationError,
+    Result,
+    ResultStatus,
+    RunContext,
+)
 from voidkit.loader import ModuleLoader, UnknownModuleError
+from voidkit.session import Session, SessionError
 from voidkit.store import ResultStore
 
 __all__ = ["Shell"]
 
 _log = structlog.get_logger("voidkit.shell")
 
-COMMANDS = ("use", "set", "unset", "show", "run", "help", "exit", "quit")
+COMMANDS = (
+    "use", "set", "unset", "show", "run", "chain", "save", "load", "help", "exit", "quit"
+)
 SHOW_SUBCOMMANDS = ("options", "modules", "results")
+CHAIN_SUBCOMMANDS = ("from", "clear", "show")
+
+DEFAULT_SESSIONS_DIR = "sessions"
+# Session names become filenames; keep them to a safe, path-traversal-free charset.
+_SESSION_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 _STATUS_STYLE = {
     ResultStatus.OK: "green",
@@ -52,12 +70,18 @@ class Shell:
         loader: ModuleLoader,
         store: ResultStore | None = None,
         console: Console | None = None,
+        sessions_dir: str | Path | None = None,
     ) -> None:
         self.loader = loader
         self.store = store if store is not None else ResultStore()
         self.console = console if console is not None else Console()
         self.current: ModuleBase | None = None
         self.should_exit = False
+        # Chaining: the id of the stored Result to feed as the next run's
+        # RunContext.upstream. Sticky until 'chain clear' or a new 'chain from'.
+        self.chain_from: str | None = None
+        self.session_name: str | None = None
+        self._sessions_dir = sessions_dir
 
     # -- prompt / completion helpers ------------------------------------------
 
@@ -72,6 +96,34 @@ class Shell:
         if self.current is None:
             return []
         return [spec.name for spec in self.current.option_specs()]
+
+    @property
+    def sessions_dir(self) -> Path:
+        """Where ``save``/``load`` read and write session files.
+
+        The constructor argument wins; otherwise ``$VOIDKIT_SESSIONS_DIR`` or
+        ``./sessions``.
+        """
+        if self._sessions_dir is not None:
+            return Path(self._sessions_dir)
+        return Path(os.environ.get("VOIDKIT_SESSIONS_DIR", DEFAULT_SESSIONS_DIR))
+
+    def _session_path(self, name: str) -> Path:
+        return self.sessions_dir / f"{name}.json"
+
+    def saved_session_names(self) -> list[str]:
+        """Names of session files on disk (for ``save``/``load`` completion)."""
+        directory = self.sessions_dir
+        if not directory.is_dir():
+            return []
+        return sorted(path.stem for path in directory.glob("*.json"))
+
+    def chain_candidates(self) -> list[str]:
+        """Chainable references for completion: module addresses then result ids."""
+        results = self.store.list_results()
+        modules = sorted({result.module_path for result in results})
+        ids = [result.id for result in results]
+        return modules + ids
 
     # -- output helpers --------------------------------------------------------
 
@@ -100,6 +152,9 @@ class Shell:
             "unset": self.cmd_unset,
             "show": self.cmd_show,
             "run": self.cmd_run,
+            "chain": self.cmd_chain,
+            "save": self.cmd_save,
+            "load": self.cmd_load,
             "help": self.cmd_help,
             "exit": self.cmd_exit,
             "quit": self.cmd_exit,
@@ -171,14 +226,187 @@ class Shell:
         if self.current is None:
             self._error("no module selected; use <category/name> first")
             return
+
+        upstream: Result | None = None
+        if self.chain_from is not None:
+            upstream = self.store.get_result(self.chain_from)
+            if upstream is None:
+                self._error(
+                    f"chain source {self.chain_from[:8]} is no longer in the store; "
+                    "'chain clear' or 'chain from <ref>' to re-point it"
+                )
+                return
+
+        context = RunContext(upstream=upstream) if upstream is not None else None
         try:
-            result = self.current.execute()
+            result = self.current.execute(context)
         except OptionValidationError as exc:
             for problem in exc.problems:
                 self._error(problem)
             return
         self.store.add_result(result)
+        if upstream is not None:
+            _log.info(
+                "shell.chained",
+                downstream=result.module_path,
+                upstream=upstream.module_path,
+                upstream_id=upstream.id,
+            )
+            self._note(f"chained from {upstream.module_path} ({upstream.id[:8]})")
         self._render_result_summary(result)
+
+    # -- chaining --------------------------------------------------------------
+
+    def cmd_chain(self, args: list[str]) -> None:
+        """Point the next run's ``upstream`` at a stored result (the chaining UX).
+
+        ``chain from <result-id|category/name>`` selects a source, ``chain clear``
+        drops it, and ``chain`` / ``chain show`` reports the current selection.
+        """
+        if not args or args[0] == "show":
+            self._show_chain()
+            return
+        sub = args[0]
+        if sub in ("clear", "off"):
+            self.chain_from = None
+            self._ok("chain cleared")
+            return
+        if sub == "from":
+            if len(args) != 2:
+                self._error("usage: chain from <result-id|category/name>")
+                return
+            result = self._resolve_chain_ref(args[1])
+            if result is None:
+                self._error(f"no stored result matches '{args[1]}' (see 'show results')")
+                return
+            self.chain_from = result.id
+            self._ok(
+                f"chaining next run(s) from {result.module_path} "
+                f"({result.id[:8]}, {len(result.records)} record(s))"
+            )
+            return
+        self._error(
+            "usage: chain [show] | chain from <result-id|category/name> | chain clear"
+        )
+
+    def _show_chain(self) -> None:
+        if self.chain_from is None:
+            self._note("no chain source set; 'chain from <result-id|module>' to set one")
+            return
+        source = self.store.get_result(self.chain_from)
+        if source is None:
+            self._note(f"chain source {self.chain_from[:8]} (no longer in the store)")
+            return
+        self._note(
+            f"chain source: {source.module_path} ({source.id[:8]}), "
+            f"{len(source.records)} record(s)"
+        )
+
+    def _resolve_chain_ref(self, ref: str) -> Result | None:
+        """Resolve a chain reference to a stored result.
+
+        Order: exact result id, then a unique id prefix (>= 4 chars, as shown by
+        ``show results``), then the most recent result from a module address.
+        """
+        exact = self.store.get_result(ref)
+        if exact is not None:
+            return exact
+        results = self.store.list_results()
+        if len(ref) >= 4:
+            prefixed = [r for r in results if r.id.startswith(ref)]
+            if len(prefixed) == 1:
+                return prefixed[0]
+            if len(prefixed) > 1:
+                return None  # ambiguous prefix: refuse rather than guess
+        by_module = [r for r in results if r.module_path == ref]
+        if by_module:
+            return by_module[-1]
+        return None
+
+    # -- session save / load ---------------------------------------------------
+
+    def cmd_save(self, args: list[str]) -> None:
+        if len(args) != 1:
+            self._error("usage: save <name>")
+            return
+        name = args[0]
+        if not _SESSION_NAME_RE.fullmatch(name) or name in (".", ".."):
+            self._error(
+                f"invalid session name '{name}' (use letters, digits, '.', '_', '-')"
+            )
+            return
+        session = self._capture_session(name)
+        try:
+            path = session.save(self._session_path(name))
+        except OSError as exc:
+            self._error(f"could not save session '{name}': {exc}")
+            return
+        self.session_name = name
+        _log.info("shell.save", name=name, path=str(path), results=len(session.results))
+        self._ok(f"session '{name}' saved to {path} ({len(session.results)} result(s))")
+
+    def cmd_load(self, args: list[str]) -> None:
+        if len(args) != 1:
+            self._error("usage: load <name>")
+            return
+        name = args[0]
+        if not _SESSION_NAME_RE.fullmatch(name) or name in (".", ".."):
+            self._error(
+                f"invalid session name '{name}' (use letters, digits, '.', '_', '-')"
+            )
+            return
+        try:
+            session = Session.load(self._session_path(name))
+        except SessionError as exc:
+            self._error(str(exc))
+            return
+        self._apply_session(session)
+        _log.info("shell.load", name=name, results=len(session.results))
+        module_note = self.current.full_name if self.current is not None else "none selected"
+        self._ok(
+            f"session '{name}' loaded ({len(session.results)} result(s), module: {module_note})"
+        )
+
+    def _capture_session(self, name: str) -> Session:
+        return Session(
+            name=name,
+            module=self.current.full_name if self.current is not None else None,
+            options=self.current.option_values if self.current is not None else {},
+            chain_from=self.chain_from,
+            results=self.store.list_results(),
+        )
+
+    def _apply_session(self, session: Session) -> None:
+        """Replace shell state with a loaded session (results, module, chain)."""
+        self.store.clear()
+        for result in session.results:
+            self.store.add_result(result)
+
+        # Keep the chain source only if it still resolves in the restored store.
+        if session.chain_from is not None and self.store.get_result(session.chain_from):
+            self.chain_from = session.chain_from
+        else:
+            self.chain_from = None
+
+        self.current = None
+        self.session_name = session.name
+        if session.module is None:
+            return
+        try:
+            module_cls = self.loader.get_module(session.module)
+        except UnknownModuleError as exc:
+            self._error(f"selected module '{session.module}' is no longer available: {exc}")
+            return
+        module = module_cls()
+        skipped = []
+        for opt_name, opt_value in session.options.items():
+            try:
+                module.set_option(opt_name, opt_value)
+            except OptionError as exc:
+                skipped.append(f"{opt_name} ({exc})")
+        self.current = module
+        if skipped:
+            self._error(f"some options could not be restored: {', '.join(skipped)}")
 
     def cmd_help(self, args: list[str]) -> None:
         table = Table(title="Commands", show_header=True, header_style="bold")
@@ -192,6 +420,11 @@ class Shell:
             ("show modules", "List all discovered modules."),
             ("show results", "List results stored this session."),
             ("run", "Validate options and execute the selected module."),
+            ("chain from <ref>", "Feed a stored result (id or module) into the next run's upstream."),
+            ("chain clear", "Stop chaining; runs go back to standalone."),
+            ("chain", "Show the current chain source."),
+            ("save <name>", "Save the session (module, options, results) to disk."),
+            ("load <name>", "Restore a saved session and continue where it left off."),
             ("help", "Show this help."),
             ("exit / quit", "Leave the shell."),
         ]

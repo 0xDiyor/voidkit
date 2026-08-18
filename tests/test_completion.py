@@ -20,7 +20,7 @@ class TestCommandCompletion:
         assert "use" in candidates and "run" in candidates and "show" in candidates
 
     def test_prefix_narrows_commands(self, shell: Shell):
-        assert complete(shell, "s") == ["set", "show"]
+        assert complete(shell, "s") == ["set", "show", "save"]
 
 
 class TestArgumentCompletion:
@@ -53,3 +53,21 @@ class TestArgumentCompletion:
         shell.dispatch("use analysis/echo")
         # Third token (the value) has no candidates.
         assert complete(shell, "set message ") == []
+
+    def test_chain_completes_subcommands(self, shell: Shell):
+        assert complete(shell, "chain ") == ["from", "clear", "show"]
+
+    def test_chain_from_completes_stored_results(self, chain_shell: Shell):
+        chain_shell.dispatch("use recon/sample")
+        chain_shell.dispatch("set target 10.0.0.5")
+        chain_shell.dispatch("run")
+        candidates = complete(chain_shell, "chain from ")
+        # Module address of the stored result is offered as a chain reference.
+        assert "recon/sample" in candidates
+
+    def test_load_completes_saved_session_names(self, chain_shell: Shell):
+        chain_shell.dispatch("use recon/sample")
+        chain_shell.dispatch("set target 10.0.0.5")
+        chain_shell.dispatch("run")
+        chain_shell.dispatch("save mysession")
+        assert complete(chain_shell, "load ") == ["mysession"]
